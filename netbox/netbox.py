@@ -7,6 +7,7 @@ import os
 import sys
 import yaml
 import argparse
+# from collections import defaultdict
 
 try:
     import requests
@@ -78,17 +79,30 @@ class NetboxAsInventory(object):
 
         # Script configuration.
         self.script_config = script_config_data
-        self.api_url = self._config(["main", "api_url"])
+        self.api_loc = self._config(["main", "api_loc"])
+        self.api_filter = self._config(["main", "api_filter"])
+        self.api_url = self.api_loc + self.api_filter
         self.api_token = self._config(["main", "api_token"], default="", optional=True)
         self.group_by = self._config(["group_by"], default={})
         self.hosts_vars = self._config(["hosts_vars"], default={})
+        self.groups_vars = self._config(["group_vars"], default={})
+        self.list_of_groups = set([])
+        # self.dict_of_group_lists = defaultdict(list)
+        self.dict_of_group_lists = {}
 
         # Get value based on key.
         self.key_map = {
             "default": "name",
             "general": "name",
             "custom": "value",
-            "ip": "address"
+            "ip": "address",
+            "identifier": "id"
+        }
+
+        # Maps sections of "group_by" to API operations for group_vars searching
+        self.section_map = {
+            "device_role": "device-roles",
+            "rack": "racks"
         }
 
     def _get_value_by_path(self, source_dict, key_path,
@@ -96,7 +110,7 @@ class NetboxAsInventory(object):
         """Get key value from nested dict by path.
 
         Args:
-            source_dict: The dict that we look into.
+            source_dict: The config dict that we look into.
             key_path: A list has the path of key. e.g. [parent_dict, child_dict, key_name].
             ignore_key_error: Ignore KeyError if the key is not found in provided path.
             default: Set default value if the key is not found in provided path.
@@ -192,6 +206,44 @@ class NetboxAsInventory(object):
         return hosts_list
 
     @staticmethod
+    def get_groups_list(api_loc, api_filter, api_token=None):
+        """Retrieves group list from netbox API.
+
+        Returns:
+            A list of all groups data retrived searching for hosts.
+        """
+
+
+        if not api_loc or not api_filter:
+            sys.exit("Please check API URL in script configuration file.")
+
+        api_url_headers = {}
+        api_url_params = {}
+
+        if api_token:
+            api_url_headers.update({"Authorization": "Token %s" % api_token})
+
+        groups_list = []
+
+        # Pagination.
+        for filter in api_filter:
+            # Get hosts list.
+            api_output = requests.get(api_loc + filter, params=api_url_params, headers=api_url_headers)
+
+            # Check that a request is 200 and not something else like 404, 401, 500 ... etc.
+            api_output.raise_for_status()
+
+            # Get api output data.
+            api_output_data = api_output.json()
+
+            if isinstance(api_output_data, dict) and "results" in api_output_data:
+                groups_list += api_output_data["results"]
+
+        # Get groups data in a list.
+        return groups_list
+
+
+    @staticmethod
     def add_host_to_group(server_name, group_value, inventory_dict):
         """Add a host to a single group.
 
@@ -211,12 +263,13 @@ class NetboxAsInventory(object):
         if group_value:
             # If the group not in the inventory it will be add.
             if group_value not in inventory_dict:
-                inventory_dict.update({group_value: []})
+                inventory_dict.update({group_value: {'hosts': [], 'vars': {}, 'children': []} })
 
             # If the host not in the group it will be add.
-            if server_name not in inventory_dict[group_value]:
-                inventory_dict[group_value].append(server_name)
+            if server_name not in inventory_dict[group_value]['hosts']:
+                inventory_dict[group_value]['hosts'].append(server_name)
         return inventory_dict
+
 
     def add_host_to_inventory(self, groups_categories, inventory_dict, host_data):
         """Add a host to its groups.
@@ -256,6 +309,9 @@ class NetboxAsInventory(object):
 
                             if group_value:
                                 inventory_dict = self.add_host_to_group(server_name, group_value, inventory_dict)
+                                # self.dict_of_group_lists[group].append(group_value)
+                                self.dict_of_group_lists.setdefault(group, set([])).add(group_value)
+                                # self.list_of_groups.add(group_value) # if I wanted to create a list
                             # If any groups defined in "group_by" section, but host is not part of that group, it will go to catch-all group.
                             else:
                                 self._put_host_to_ungrouped(inventory_dict, server_name)
@@ -265,7 +321,8 @@ class NetboxAsInventory(object):
         # If no groups and no category in "group_by" section, the host will go to catch-all group.
         else:
             self._put_host_to_ungrouped(inventory_dict, server_name)
-
+        # raise ValueError(self.dict_of_group_lists)
+        # raise ValueError(self.list_of_groups)
         return inventory_dict
 
     @staticmethod
@@ -321,6 +378,60 @@ class NetboxAsInventory(object):
                         host_vars_dict.update({var_name: var_value})
         return host_vars_dict
 
+    def get_group_vars(self, group_data, group_vars):
+        """Find host vars.
+
+        These vars will be used for host in the inventory.
+        We can select whatever from netbox to be used as Ansible inventory vars.
+        The vars are defined in script config file.
+
+        Args:
+            group_data: Dict, it has a group data which will be added to inventory.
+            group_vars: Dict, it has selected fields to be used as group vars.
+
+        Returns:
+            A dict has all vars are associated with the host.
+        """
+
+        group_vars_dict = dict()
+        if group_vars:
+            categories_source = {
+                "ip": group_data,
+                "general": group_data,
+                "identifier": group_data,
+                "custom": group_data.get("custom_fields")
+            }
+
+            # Get host vars based on selected vars. (that should come from
+            # script's config file)
+            for category in group_vars:
+                key_name = self.key_map[category]
+                data_dict = categories_source[category]
+
+                for data_dict_key, data_dict_value in data_dict.items():
+                    if isinstance(data_dict_value, dict):
+                        for var_name, var_data in data_dict_value.items():
+                                # TODO This is because "custom_fields" has more than 1 type.
+                                # Values inside "custom_fields" could be a key:value or a dict.
+                            if var_name == key_name:
+                                var_value = self._get_value_by_path(data_dict_value, [var_name, key_name], ignore_key_error=True)
+
+                    else:
+                        var_value = self._get_value_by_path(data_dict, [data_dict_key, key_name], ignore_key_error=True)
+
+                    if var_value is not None:
+                        # Remove CIDR from IP address.
+                        if "ip" in group_vars and var_data in group_vars["ip"].values():
+                            var_value = var_value.split("/")[0]
+                        # Add var to host dict.
+                        for group_type in group_vars[category]:
+                            for k,v in group_vars[category][group_type].items():
+                                if data_dict_key == v:
+                                    group_vars_dict.update({k: var_value})
+
+        return group_vars_dict
+
+
     def update_host_meta_vars(self, inventory_dict, host_name, host_vars):
         """Update host meta vars.
 
@@ -341,11 +452,54 @@ class NetboxAsInventory(object):
             inventory_dict.update({host_name: host_vars})
         return inventory_dict
 
+    @staticmethod
+    def update_group_vars(inventory_dict, group_name, group_vars):
+        """Update host meta vars.
+
+        Add host and its vars to "_meta.hostvars" path in the inventory.
+
+        Args:
+            inventory_dict: A dict for inventory has groups and hosts.
+            group_name: Name of the group that will have vars.
+            group_vars: A dict has selected fields to be used as group vars.
+
+        Returns:
+            The dict "inventory_dict" after updating the host meta data.
+        """
+
+        if group_vars:
+            inventory_dict[group_name['name']]['vars'].update(group_vars)
+
+        return inventory_dict
+
+    def _generate_group_var_filters(self, dict_of_group_lists):
+        """
+        Maps sections variables to API operations
+
+        Args:
+            dict_of_group_lists: A dict with section names as a key and
+                a list of groups if that section as a valueself.
+
+        Returns:
+            The list of endpoints to search group variables in.
+        """
+        # TODO: set automatically dcim vs ipam vs virtualizzation vs circuits
+        # TODO: set automatically ?name
+        # TODO: filter devices per custom_fields
+        gr_list = []
+
+        for k, v in dict_of_group_lists.items():
+            for i in v:
+                f = "dcim/" + self.section_map[k] + "/?name=" + i
+                gr_list.append(f)
+
+        return gr_list
+
     def generate_inventory(self):
         """Generate Ansible dynamic inventory.
 
         Returns:
-            A dict has inventory with hosts and their vars.
+            A dict has inventory with hosts, groups and their vars.
         """
 
         inventory_dict = dict()
@@ -358,6 +512,16 @@ class NetboxAsInventory(object):
                 self.add_host_to_inventory(self.group_by, inventory_dict, current_host)
                 host_vars = self.get_host_vars(current_host, self.hosts_vars)
                 inventory_dict = self.update_host_meta_vars(inventory_dict, server_name, host_vars)
+
+        api_filter_list = ["dcim/device-roles/?slug=acces-switch"] + self._generate_group_var_filters(self.dict_of_group_lists)
+        netbox_groups_list = self.get_groups_list(self.api_loc, api_filter_list, self.api_token)
+
+        if netbox_groups_list:
+            for current_group in netbox_groups_list:
+                group_vars = self.get_group_vars(current_group, self.groups_vars)
+                # raise ValueError(group_vars)
+                inventory_dict = self.update_group_vars(inventory_dict, current_group, group_vars)
+
         return inventory_dict
 
     def print_inventory_json(self, inventory_dict):
