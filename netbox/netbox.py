@@ -7,6 +7,7 @@ import os
 import sys
 import yaml
 import argparse
+import warnings
 # from collections import defaultdict
 
 try:
@@ -80,8 +81,9 @@ class NetboxAsInventory(object):
         # Script configuration.
         self.script_config = script_config_data
         self.api_loc = self._config(["main", "api_loc"])
+        self.api_section = self._config(["main", "api_section"])
         self.api_filter = self._config(["main", "api_filter"])
-        self.api_url = self.api_loc + self.api_filter
+        self.api_url = self.api_loc + self.api_section + self.api_filter
         self.api_token = self._config(["main", "api_token"], default="", optional=True)
         self.group_by = self._config(["group_by"], default={})
         self.hosts_vars = self._config(["hosts_vars"], default={})
@@ -99,10 +101,11 @@ class NetboxAsInventory(object):
             "identifier": "id"
         }
 
-        # Maps sections of "group_by" to API operations for group_vars searching
+        # Maps sections of "group_by" (together with its parent component) to API operations for group_vars searching e.g:
+        # "variable_name": "/component/section"
         self.section_map = {
-            "device_role": "device-roles",
-            "rack": "racks"
+            "device_role": "/dcim/device-roles",
+            "rack": "/dcim/racks"
         }
 
     def _get_value_by_path(self, source_dict, key_path,
@@ -321,8 +324,7 @@ class NetboxAsInventory(object):
         # If no groups and no category in "group_by" section, the host will go to catch-all group.
         else:
             self._put_host_to_ungrouped(inventory_dict, server_name)
-        # raise ValueError(self.dict_of_group_lists)
-        # raise ValueError(self.list_of_groups)
+
         return inventory_dict
 
     @staticmethod
@@ -409,15 +411,15 @@ class NetboxAsInventory(object):
                 data_dict = categories_source[category]
 
                 for data_dict_key, data_dict_value in data_dict.items():
-                    if isinstance(data_dict_value, dict):
-                        for var_name, var_data in data_dict_value.items():
-                                # TODO This is because "custom_fields" has more than 1 type.
-                                # Values inside "custom_fields" could be a key:value or a dict.
-                            if var_name == key_name:
-                                var_value = self._get_value_by_path(data_dict_value, [var_name, key_name], ignore_key_error=True)
-
-                    else:
-                        var_value = self._get_value_by_path(data_dict, [data_dict_key, key_name], ignore_key_error=True)
+                    # if isinstance(data_dict_value, dict):
+                    #     for var_name, var_data in data_dict_value.items():
+                    #             # TODO This is because "custom_fields" has more than 1 type.
+                    #             # Values inside "custom_fields" could be a key:value or a dict.
+                    #         if var_name == key_name:
+                    #             var_value = self._get_value_by_path(data_dict_value, [var_name, key_name], ignore_key_error=True)
+                    #
+                    # else:
+                    var_value = self._get_value_by_path(data_dict, [data_dict_key, key_name], ignore_key_error=True)
 
                     if var_value is not None:
                         # Remove CIDR from IP address.
@@ -472,7 +474,7 @@ class NetboxAsInventory(object):
 
         return inventory_dict
 
-    def _generate_group_var_filters(self, dict_of_group_lists):
+    def _generate_group_var_endpoints(self, dict_of_group_lists):
         """
         Maps sections variables to API operations
 
@@ -483,15 +485,17 @@ class NetboxAsInventory(object):
         Returns:
             The list of endpoints to search group variables in.
         """
-        # TODO: set automatically dcim vs ipam vs virtualizzation vs circuits
-        # TODO: set automatically ?name
-        # TODO: filter devices per custom_fields
+        # TODO: set automatically ?name if necessary
+        # TODO: implement a method for autmatic sectio_map generation
         gr_list = []
 
-        for k, v in dict_of_group_lists.items():
-            for i in v:
-                f = "dcim/" + self.section_map[k] + "/?name=" + i
-                gr_list.append(f)
+        for section, section_value in dict_of_group_lists.items():
+            if section in self.section_map:
+                for item in section_value:
+                    url_filter = self.section_map[section] + "/?name=" + item
+                    gr_list.append(url_filter)
+            else:
+                warnings.warn("There is no such a key: '" + section + "'. Check if it rappresents a netbox section, if so add a correct mapping to 'section_map' in the code.")
 
         return gr_list
 
@@ -513,13 +517,12 @@ class NetboxAsInventory(object):
                 host_vars = self.get_host_vars(current_host, self.hosts_vars)
                 inventory_dict = self.update_host_meta_vars(inventory_dict, server_name, host_vars)
 
-        api_filter_list = ["dcim/device-roles/?slug=acces-switch"] + self._generate_group_var_filters(self.dict_of_group_lists)
+        api_filter_list = self._generate_group_var_endpoints(self.dict_of_group_lists)
         netbox_groups_list = self.get_groups_list(self.api_loc, api_filter_list, self.api_token)
 
         if netbox_groups_list:
             for current_group in netbox_groups_list:
                 group_vars = self.get_group_vars(current_group, self.groups_vars)
-                # raise ValueError(group_vars)
                 inventory_dict = self.update_group_vars(inventory_dict, current_group, group_vars)
 
         return inventory_dict
