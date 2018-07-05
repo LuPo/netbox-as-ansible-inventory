@@ -1,7 +1,9 @@
 netbox:
     main:
-        api_url: 'http://localhost/api/dcim/devices/'
-        #api_token: ''
+        api_url: 'http://localhost/api'
+        api_section: '/dcim/devices'
+        api_filter: '/?role=acces-switch'
+        api_token: ''
 
     # How servers will be grouped.
     # If no group specified here, inventory script will return all servers.
@@ -26,3 +28,19 @@ netbox:
         # Custom sections (custom_fields) could be used as vars too.
         #custom:
         #    env: env
+
+    # Use Netbox sections from groups selected as group variables in a following structure:
+    # group_vars:
+    #   <category>: #(As in hosts_vars)
+    #     <group-types>: #(mapping between object names with witch hosts are "grouped_by" and API sections)
+    #       <group_var_name>: <"variable key">  #(retrived from group-types querry to netbox)
+    group_vars:
+        general: # Returns 'name'
+            racks:
+              site_name: site
+              created_on: created
+            device-roles:
+              device_color: color
+        identifier: # Returns 'id'
+            racks:
+              site_id: site
